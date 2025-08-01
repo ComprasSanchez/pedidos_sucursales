@@ -68,6 +68,8 @@ async function fetchQuantio(ean, sucursal) {
 }
 
 
+
+
 // Monroe (login + consultarStock)
 async function fetchMonroe(ean, sucursal, cantidad) {
   try {
