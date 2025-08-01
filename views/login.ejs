@@ -1,0 +1,11 @@
+<h2>Iniciar sesión</h2>
+
+<% if (typeof error !== 'undefined') { %>
+  <p style="color:red;"><%= error %></p>
+<% } %>
+
+<form method="POST" action="/login">
+  <input name="usuario" placeholder="Usuario" required />
+  <input name="contrasena" type="password" placeholder="Contraseña" required />
+  <button type="submit">Ingresar</button>
+</form>

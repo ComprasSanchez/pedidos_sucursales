@@ -1,0 +1,256 @@
+<!-- views/comparativa.ejs -->
+<h2>Comparativa de Droguerías</h2>
+
+<form method="POST" action="/pedido">
+  <table border="1" cellpadding="6" cellspacing="0" style="width:100%; border-collapse:collapse; font-family:Arial, sans-serif;">
+    <thead>
+      <tr style="background:#e6e6e6; font-weight:bold; text-align:center;">
+        <th style="min-width:220px;">PRODUCTO</th>
+        <th style="width:60px;">CANT.</th>
+        <th style="width:100px;">Quantio</th>
+        <th style="width:220px;">Monroe</th>
+        <th style="width:160px;">Cofarsur</th>
+        <th style="width:160px;">Suizo</th>
+        <th style="width:160px;">Kellerhof</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% tabla.forEach((row, i) => { %>
+        <% 
+          const isSelected = name => row.seleccionado === name;
+          const effectivePrice = o => {
+            if (!o) return null;
+            if (typeof o.offerPrice === 'number') return o.offerPrice;
+            if (typeof o.priceList === 'number') return o.priceList;
+            if (typeof o.priceCompra === 'number') return o.priceCompra; // cofarsur legacy
+            return null;
+          };
+
+          // Helper para leyenda de oferta simplificada
+          const formatMonroeOffer = o => {
+            if (!o) return '';
+            const parts = [];
+            if (o.Descuento && typeof o.Descuento.porcentaje === 'number') {
+              parts.push(`${o.Descuento.porcentaje}%`);
+            }
+            const minU = o.Condicion_Compra?.minimo_unids;
+            if (minU) {
+              parts.push(`min ${minU} Unid${minU > 1 ? 'es' : ''}`);
+            }
+            return parts.join(' ');
+          };
+
+          const formatSuizoOffer = raw => {
+            if (!raw) return '';
+            // ejemplo: "FAR-20.00% Min.:1 -Dto.Cli"
+            const pctMatch = raw.match(/(\d{1,2}(?:\.\d+)?)%/);
+            const minMatch = raw.match(/Min\.?:\s*:?(\d+)/i);
+            const parts = [];
+            if (pctMatch) parts.push(`${pctMatch[1]}%`);
+            if (minMatch) parts.push(`min ${minMatch[1]} Unid${parseInt(minMatch[1])>1?'es':''}`);
+            return parts.join(' ');
+          };
+
+          const formatCofarsurOffer = respPrice => {
+            if (!respPrice) return '';
+            // Usa costo_oferta_sin_iva vs costo_sin_iva y mensaje mínimo
+            const parts = [];
+            if (respPrice.descuento_oferta) {
+              parts.push(`${respPrice.descuento_oferta}%`);
+            }
+            // el mensaje suele decir "minimo 2 unidades" u otro
+            if (respPrice.mensaje) {
+              const m = ('' + respPrice.mensaje).trim();
+              if (m) {
+                // intentar extraer número de mínimo
+                const minMatch = m.match(/minimo\s*(\d+)/i);
+                if (minMatch) parts.push(`min ${minMatch[1]} Unid${parseInt(minMatch[1])>1?'es':''}`);
+              }
+            }
+            return parts.join(' ');
+          };
+
+        %>
+        <tr>
+          <!-- Producto -->
+          <td style="padding:6px;">
+            <% if (row.descripcion) { %>
+              <strong><%= row.descripcion %></strong><br>
+              <small style="color:#555;">CB: <%= row.codigo_barras || row.codigo_barras %></small>
+            <% } else { %>
+              <small><%= row.codigo_barras %></small>
+            <% } %>
+          </td>
+
+          <!-- Cantidad -->
+          <td style="text-align:center;"><%= row.cantidad %></td>
+
+          <!-- Quantio -->
+          <td style="text-align:center; position:relative; background:<%= isSelected('quantio') ? '#d4f8d4' : '' %>;">
+            <div style="font-size:14px;">
+              <% if (row.quantio && row.quantio.stock) { %>
+                ✔️
+              <% } else { %>
+                ❌
+              <% } %>
+            </div>
+            <div style="margin-top:4px;">
+              <label style="cursor:pointer; display:inline-block;">
+                <input type="radio" name="seleccion_<%= i %>" value="quantio" class="sel-radio" data-row="<%= i %>" data-provider="quantio" <%= isSelected('quantio') ? 'checked' : '' %> />
+                <span style="font-weight:bold;">Q</span>
+              </label>
+            </div>
+          </td>
+
+          <!-- Monroe -->
+          <td style="padding:6px; background:<%= isSelected('monroe') ? '#d4f8d4' : '' %>;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <div style="flex:1;">
+                <% if (row.monroe && row.monroe.priceList != null) { %>
+                  <% if (row.monroe.offerPrice != null) { %>
+                    <div style="font-size:12px; color:#555;">
+                      <s>$<%= row.monroe.priceList.toFixed(2) %></s>
+                    </div>
+                    <div style="font-weight:bold;">$<%= row.monroe.offerPrice.toFixed(2) %></div>
+                    <% if (row.monroe.offers && row.monroe.offers.length) { %>
+                      <div style="margin-top:4px; font-size:11px; color:#333;">
+                        <% row.monroe.offers.forEach(o => { %>
+                          <div>
+                            • <%= formatMonroeOffer(o) %>
+                          </div>
+                        <% }) %>
+                      </div>
+                    <% } %>
+                  <% } else { %>
+                    <div>$<%= row.monroe.priceList.toFixed(2) %></div>
+                  <% } %>
+                <% } else if (row.monroe && row.monroe.stock === false) { %>
+                  SIN STOCK
+                <% } else { %>
+                  NO DISPONIBLE
+                <% } %>
+              </div>
+              <div style="margin-left:8px;">
+                <label style="cursor:pointer;">
+                  <input type="radio" name="seleccion_<%= i %>" value="monroe" class="sel-radio" data-row="<%= i %>" data-provider="monroe" <%= isSelected('monroe') ? 'checked' : '' %> />
+                  <span style="font-weight:bold;">M</span>
+                </label>
+              </div>
+            </div>
+          </td>
+
+          <!-- Cofarsur -->
+          <td style="padding:6px; background:<%= isSelected('cofarsur') ? '#d4f8d4' : '' %>;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <div style="flex:1;">
+                <% if (row.cofarsur && row.cofarsur.stock === true) { %>
+                  <% if (typeof row.cofarsur.priceCompra === 'number') { %>
+                    <div>$<%= row.cofarsur.priceCompra.toFixed(2) %></div>
+                    <% if (row.cofarsur.mensaje || row.cofarsur.descuento_oferta) { %>
+                      <div style="font-size:11px; margin-top:2px;">
+                        <% 
+                          // construir leyenda simple de Cofarsur
+                          const legend = [];
+                          if (row.cofarsur.descuento_oferta) legend.push(`${row.cofarsur.descuento_oferta}%`);
+                          if (row.cofarsur.mensaje) {
+                            const minMatch = (''+row.cofarsur.mensaje).match(/minimo\s*(\d+)/i);
+                            if (minMatch) legend.push(`min ${minMatch[1]} Unid${parseInt(minMatch[1])>1?'es':''}`);
+                          }
+                        %>
+                        <%= legend.join(' ') %>
+                      </div>
+                    <% } %>
+                  <% } else { %>
+                    $<%= row.cofarsur.priceCompra != null ? row.cofarsur.priceCompra : '' %>
+                  <% } %>
+                <% } else if (row.cofarsur && row.cofarsur.stock === false) { %>
+                  SIN STOCK
+                <% } else { %>
+                  NO DISPONIBLE
+                <% } %>
+              </div>
+              <div style="margin-left:8px;">
+                <label style="cursor:pointer;">
+                  <input type="radio" name="seleccion_<%= i %>" value="cofarsur" class="sel-radio" data-row="<%= i %>" data-provider="cofarsur" <%= isSelected('cofarsur') ? 'checked' : '' %> />
+                  <span style="font-weight:bold;">C</span>
+                </label>
+              </div>
+            </div>
+          </td>
+
+          <!-- Suizo -->
+          <td style="padding:6px; background:<%= isSelected('suizo') ? '#d4f8d4' : '' %>;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <div style="flex:1;">
+                <% 
+                  const suizoPrice = effectivePrice(row.suizo);
+                %>
+                <% if (row.suizo && suizoPrice != null) { %>
+                  <div>$<%= suizoPrice.toFixed(2) %></div>
+                  <% if (row.suizo.oferta) { %>
+                    <div style="font-size:11px; margin-top:2px;">
+                      <%= formatSuizoOffer(row.suizo.oferta) %>
+                    </div>
+                  <% } %>
+                <% } else if (row.suizo && row.suizo.stock === false) { %>
+                  SIN STOCK
+                <% } else { %>
+                  NO DISPONIBLE
+                <% } %>
+              </div>
+              <div style="margin-left:8px;">
+                <label style="cursor:pointer;">
+                  <input type="radio" name="seleccion_<%= i %>" value="suizo" class="sel-radio" data-row="<%= i %>" data-provider="suizo" <%= isSelected('suizo') ? 'checked' : '' %> />
+                  <span style="font-weight:bold;">S</span>
+                </label>
+              </div>
+            </div>
+          </td>
+
+          <!-- Kellerhof -->
+          <td style="padding:6px; background:<%= isSelected('kellerhof') ? '#d4f8d4' : '' %>;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <div style="flex:1;">
+                <% if (row.kellerhof && row.kellerhof.priceList != null) { %>
+                  <% if (row.kellerhof.offerPrice != null) { %>
+                    <div style="font-size:12px; color:#555;">
+                      <s>$<%= row.kellerhof.priceList.toFixed(2) %></s>
+                    </div>
+                    <div style="font-weight:bold;">$<%= row.kellerhof.offerPrice.toFixed(2) %></div>
+                  <% } else { %>
+                    <div>$<%= row.kellerhof.priceList.toFixed(2) %></div>
+                  <% } %>
+                <% } else if (row.kellerhof && row.kellerhof.stock === false) { %>
+                  SIN STOCK
+                <% } else { %>
+                  NO DISPONIBLE
+                <% } %>
+              </div>
+              <div style="margin-left:8px;">
+                <label style="cursor:pointer;">
+                  <input type="radio" name="seleccion_<%= i %>" value="kellerhof" class="sel-radio" data-row="<%= i %>" data-provider="kellerhof" <%= isSelected('kellerhof') ? 'checked' : '' %> />
+                  <span style="font-weight:bold;">K</span>
+                </label>
+              </div>
+            </div>
+          </td>
+        </tr>
+      <% }) %>
+    </tbody>
+  </table>
+
+  <button type="submit" style="margin-top:12px;">🛒 Pedir</button>
+</form>
+
+<script>
+  // opcional: si querés que al cambiar radio se actualice visualmente sin recargar
+  document.querySelectorAll('.sel-radio').forEach(r => {
+    r.addEventListener('change', e => {
+      const rowIdx = e.target.dataset.row;
+      const provider = e.target.dataset.provider;
+      // re-pintar filas: simple estrategia reload (podés mejorar con DOM)
+      // por ahora que quede para submit del form; si querés que cambie puro,
+      // habría que manejar clases via JS y quitar de otros.
+    });
+  });
+</script>

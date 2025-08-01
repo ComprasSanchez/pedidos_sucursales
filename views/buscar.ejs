@@ -1,0 +1,69 @@
+<!-- views/buscar.ejs -->
+<h2>Buscar producto por código de barras</h2>
+
+<form method="POST" action="/buscar-producto">
+  <input
+    type="text"
+    name="codebar"
+    placeholder="Escanear o ingresar EAN"
+    value="<%= codebar || '' %>"
+    required
+  />
+  <button type="submit">🔎 Buscar</button>
+</form>
+
+<% if (error) { %>
+  <p style="color:red;"><%= error %></p>
+<% } %>
+
+<% if (resultado || codebar) { %>
+  <p>
+    <% if (resultado) { %>
+      ✅ <strong><%= resultado.descripcion %></strong>
+    <% } else { %>
+      ⚠️ Código <%= codebar %> añadido sin descripción
+    <% } %>
+  </p>
+
+  <form method="POST" action="/agregar-carrito">
+    <input type="hidden" name="codigo_barras" value="<%= codebar %>">
+    <input type="hidden" name="descripcion" value="<%= resultado ? resultado.descripcion : '' %>">
+    <label>Cantidad:
+      <input type="number" name="cantidad" value="1" min="1" required>
+    </label>
+    <button type="submit">🛒 Agregar a la lista</button>
+  </form>
+<% } %>
+
+
+
+<h3>📝 Lista actual</h3>
+<table border="1" cellpadding="4">
+  <thead>
+    <tr>
+      <th>CODEBAR</th>
+      <th>PRODUCTO</th>
+      <th>CANTIDAD</th>
+    </tr>
+  </thead>
+  <tbody>
+    <% if (session.carrito && session.carrito.length > 0) { %>
+      <% session.carrito.forEach(item => { %>
+        <tr>
+          <td><%= item.codigo_barras %></td>
+          <td><%= item.descripcion %></td>
+          <td><%= item.cantidad %></td>
+        </tr>
+      <% }) %>
+    <% } else { %>
+      <tr>
+        <td colspan="3" style="text-align:center">No hay productos en la lista</td>
+      </tr>
+    <% } %>
+  </tbody>
+</table>
+<hr/>
+
+<form method="GET" action="/comparativa">
+  <button type="submit">📊 Consultar</button>
+</form>
