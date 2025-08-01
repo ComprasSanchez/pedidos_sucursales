@@ -3,9 +3,10 @@ const axios = require('axios');
 const xml2js = require('xml2js');
 const { stripPrefix } = require('xml2js').processors;
 const { db, plex } = require('../db');
+const QUANTIO_URL = 'http://sanchezantoniolli.quantio.com.ar:8081/wsquantiorest';
 
 
-async function fetchQuantio(ean, sucursal) {
+    async function fetchQuantio(ean, sucursal) {
   try {
     // 1) Credenciales desde tu tabla credenciales_droguerias usando db
     const [credRows] = await db.query(`
@@ -56,7 +57,7 @@ async function fetchQuantio(ean, sucursal) {
     const item = productos.find(p => String(p.id) === codPlex);
     const hasStock = Boolean(item && parseInt(item.stock, 10) > 0);
 
-    return { stock: hasStock };
+    return { stock: hasStock, idproducto: codPlex };
   }
   catch (err) {
     if (err.response) {
@@ -65,7 +66,67 @@ async function fetchQuantio(ean, sucursal) {
     console.error('Quantio error:', err.message);
     return { stock: false };
   }
+  
 }
+
+
+async function crearPedidoQuantio(tabla, sucursal) {
+  // Buscar credenciales de Quantio desde la DB
+  const [credRows] = await db.query(`
+    SELECT
+      quantio_usuario AS usuario,
+      quantio_clave   AS clave
+    FROM credenciales_droguerias
+    WHERE sucursal_codigo = ?
+  `, [sucursal]);
+
+  if (!credRows.length) {
+    return { error: '❌ No se encontraron credenciales de Quantio para esta sucursal.' };
+  }
+
+  const { usuario, clave } = credRows[0];
+
+  // Armar los productos seleccionados
+  const productosQuantio = tabla
+  .filter(row => row.seleccionado === 'quantio' && row.quantio?.idproducto)
+  .map(row => ({
+    idproducto: String(row.quantio.idproducto),
+    cantidad: String(row.cantidad || 1),
+    ordenplex: ''
+  }));
+
+  if (productosQuantio.length === 0) {
+    return { error: 'No hay productos seleccionados en Quantio para pedir.' };
+  }
+
+  // Armar el body del pedido
+  const body = {
+    request: {
+      type: 'CREAR_PEDIDO',
+      content: {
+        productos: productosQuantio
+      }
+    }
+  };
+
+  try {
+    const resp = await axios.post(QUANTIO_URL, body, {
+      auth: { username: usuario, password: clave },
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    console.log('✅ Pedido enviado a Quantio:', resp.data);
+    return { ok: true, resultado: resp.data };
+  } catch (err) {
+    console.error('❌ Error al crear pedido en Quantio:', err?.response?.data || err.message);
+    return {
+      error: 'Fallo al crear el pedido en Quantio',
+      detalle: err?.response?.data || err.message
+    };
+  }
+}
+
 
 
 
@@ -478,7 +539,8 @@ exports.comparativa = async (req, res) => {
 
     // Normalizamos / homogeneizamos shapes
     const quantio = {
-      stock: !!(quantioRaw && quantioRaw.stock)
+      stock: !!(quantioRaw && quantioRaw.stock),
+      idproducto: quantioRaw?.idproducto
     };
 
     const monroe = {
@@ -534,18 +596,36 @@ exports.comparativa = async (req, res) => {
       }
     }
 
-    tabla.push({
-      codigo_barras,
-      descripcion,
-      cantidad,
-      quantio,
-      monroe,
-      cofarsur,
-      suizo,
-      kellerhof,
-      seleccionado
-    });
-  }
+    // empujás cada fila dentro del for...
+tabla.push({
+  codigo_barras,
+  descripcion,
+  cantidad,
+  quantio,
+  monroe,
+  cofarsur,
+  suizo,
+  kellerhof,
+  seleccionado
+});
+} // <- cierre del for
 
-  res.render('comparativa', { tabla });
+// POST: inyectar selección y disparar pedido a Quantio
+if (req.method === 'POST') {
+  tabla.forEach((row, i) => {
+    row.seleccionado = req.body[`seleccion_${i}`] || row.seleccionado;
+  });
+  console.log('➡️ Sucursal al crear pedido:', req.session.user?.sucursal_codigo);
+  const resultadoPedido = await crearPedidoQuantio(tabla, req.session.user?.sucursal_codigo);
+  if (resultadoPedido.error) {
+    console.warn('Error en pedido Quantio:', resultadoPedido);
+    res.locals.errorQuantio = resultadoPedido;
+  } else {
+    console.log('Pedido Quantio exitoso:', resultadoPedido.resultado);
+    res.locals.successQuantio = resultadoPedido.resultado;
+  }
+}
+
+res.render('comparativa', { tabla });
 };
+module.exports.crearPedidoQuantio = crearPedidoQuantio;

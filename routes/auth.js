@@ -67,6 +67,9 @@ router.post('/agregar-carrito', isAuthenticated, (req, res) => {
 });
 
 // ─── COMPARATIVA ────────────────────
-router.get('/comparativa', isAuthenticated, pedidosController.comparativa);
+router.route('/comparativa')
+  .get(isAuthenticated, pedidosController.comparativa)
+  .post(isAuthenticated, pedidosController.comparativa);
+
 
 module.exports = router;
