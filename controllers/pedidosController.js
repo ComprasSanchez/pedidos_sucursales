@@ -681,6 +681,116 @@ async function fetchSuizo(ean, sucursal) {
 
 
 
+async function crearPedidoSuizo(
+  tabla,
+  sucursal,
+  {
+    empresa = 1,         // tnEmpresa
+    formato = 1,         // tnFormato (1 = devuelve texto)
+    tipo = 'CONFIRMA',   // tcTipo
+    entrega = ''         // tcEntrega
+  } = {}
+) {
+  try {
+    // 1) Credenciales
+    const [credRows] = await db.query(`
+      SELECT 
+        suizo_usuario AS usuario,
+        suizo_clave   AS clave
+      FROM credenciales_droguerias
+      WHERE sucursal_codigo = ?
+    `, [sucursal]);
+    if (!credRows.length) throw new Error('Credenciales Suizo no encontradas');
+
+    const { usuario, clave } = credRows[0];
+
+    // 2) Items seleccionados en Suizo
+    const items = tabla
+      .filter(r => r.seleccionado === 'suizo')
+      .map(r => ({
+        cod_barra: r.codigo_barras,
+        cantidad: String(r.cantidad || 1),
+      }));
+
+    if (!items.length) return { skip: true, msg: 'No hay productos seleccionados en Suizo.' };
+
+    // 3) Construir el XML interno <pedidoid>…</pedidoid>
+    const innerRows = items.map(it =>
+      `<row><cod_barra>${it.cod_barra}</cod_barra><cantidad>${it.cantidad}</cantidad></row>`
+    ).join('');
+
+    const innerPedidoXML = `<pedidoid>${innerRows}</pedidoid>`;
+
+    // 4) Escapar para mandarlo dentro de tcPedidoXML (muy importante)
+    const xmlEscape = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    const tcPedidoXML = xmlEscape(innerPedidoXML);
+
+    // 5) Envelope SOAP como en tu Postman
+    const envelope = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ws="http://tempuri.org/wspedidos2/">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <ws:PedidoID>
+      <tnEmpresa>${empresa}</tnEmpresa>
+      <tcUsuario>${usuario}</tcUsuario>
+      <tcClave>${clave}</tcClave>
+      <tcPedidoXML>${tcPedidoXML}</tcPedidoXML>
+      <tnFormato>${formato}</tnFormato>
+      <tcTipo>${tipo}</tcTipo>
+      <tcEntrega>${entrega}</tcEntrega>
+    </ws:PedidoID>
+  </soapenv:Body>
+</soapenv:Envelope>`.trim();
+
+    console.log('📤 Suizo PedidoID XML:', envelope);
+
+    // 6) POST
+    const url = 'https://ws.suizoargentina.com/webservice/wspedidos2.wsdl';
+    const resp = await axios.post(url, envelope, {
+      headers: {
+        'Content-Type': 'text/xml; charset=UTF-8',
+        'SOAPAction': '"http://tempuri.org/wspedidos2/PedidoID"'
+      },
+      timeout: 20000
+    });
+
+    console.log('📥 Suizo PedidoID RAW:', resp.data);
+
+    // 7) Parseo básico
+    const parsed = await xml2js.parseStringPromise(resp.data, {
+      explicitArray: false,
+      tagNameProcessors: [stripPrefix],
+    });
+
+    const body = parsed.Envelope?.Body || parsed.Body;
+    if (body?.Fault) {
+      const msg = typeof body.Fault.faultstring === 'object'
+        ? body.Fault.faultstring._ : body.Fault.faultstring;
+      return { error: 'Fault Suizo', detalle: msg };
+    }
+
+    // típicamente: Body.PedidoIDResponse.Result (o PedidoIDResult)
+    const resultado = body?.PedidoIDResponse?.Result
+                   || body?.PedidoIDResponse?.PedidoIDResult
+                   || body;
+
+    return { ok: true, resultado, enviado: { items } };
+
+  } catch (err) {
+    const detalle = err?.response?.data || err.message;
+    console.error('❌ Error PedidoID Suizo:', detalle);
+    return { error: 'Fallo al crear el pedido en Suizo', detalle };
+  }
+}
+
+
+
+
+
+
+
 async function fetchKellerhof(ean, sucursal) { try { return { priceList:null, offerPrice:null }; } catch(e){return{priceList:null,offerPrice:null}} }
 
 // controllers/pedidosController.js
@@ -849,6 +959,28 @@ if (hayC) {
   }
 }
 
+
+// --- Suizo: solo si hay seleccionados en S ---
+const haySuizo = tabla.some(r => r.seleccionado === 'suizo');
+if (haySuizo) {
+  const resSuizo = await crearPedidoSuizo(
+    tabla,
+    req.session.user?.sucursal_codigo,
+    {
+      empresa: 1,
+      formato: 1,
+      tipo: 'CONFIRMA',   // o 'RESERVA' si quisieras reservar primero
+      entrega: ''         // si tenés un código/observación de entrega, ponelo acá
+    }
+  );
+  if (resSuizo?.error) {
+    console.warn('Error en pedido Suizo:', resSuizo);
+    res.locals.errorSuizo = resSuizo;
+  } else if (!resSuizo?.skip) {
+    console.log('Pedido Suizo OK:', resSuizo.resultado);
+    res.locals.successSuizo = resSuizo.resultado;
+  }
+}
 res.render('comparativa', { tabla });
 
 };
