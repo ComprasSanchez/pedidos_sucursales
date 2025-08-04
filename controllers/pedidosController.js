@@ -4,6 +4,9 @@ const xml2js = require('xml2js');
 const { stripPrefix } = require('xml2js').processors;
 const { db, plex } = require('../db');
 const QUANTIO_URL = 'http://sanchezantoniolli.quantio.com.ar:8081/wsquantiorest';
+// Cache en memoria por sucursal (evita logins repetidos)
+const monroeTokenCache = new Map(); // key: sucursal, value: { token, exp: ms }
+const MONROE_TOKEN_TTL_MS = 4 * 60 * 1000; // 4 minutos (ellos dan 300s)
 
 
     async function fetchQuantio(ean, sucursal) {
@@ -142,23 +145,32 @@ async function fetchMonroe(ean, sucursal, cantidad) {
     if (!credRows.length) throw new Error('Credenciales Monroe no encontradas');
     const { monroe_software_key, monroe_ecommerce_key, monroe_cuenta } = credRows[0];
 
-    const loginRes = await axios.get(
-      'https://servicios.monroeamericana.com.ar/api-cli/Auth/login',
-      {
-        params: {
-          software_key: monroe_software_key,
-          token_duration: 300,
-          ecommerce_customer_key: monroe_ecommerce_key,
-          ecommerce_customer_reference: monroe_cuenta
+    // --- NUEVO: usar cache de token ---
+    const now = Date.now();
+    let token = null;
+    const cached = monroeTokenCache.get(sucursal);
+    if (cached && cached.exp > now) {
+      token = cached.token;
+    } else {
+      const loginRes = await axios.get(
+        'https://servicios.monroeamericana.com.ar/api-cli/Auth/login',
+        {
+          params: {
+            software_key: monroe_software_key,
+            token_duration: 300,
+            ecommerce_customer_key: monroe_ecommerce_key,
+            ecommerce_customer_reference: monroe_cuenta
+          }
         }
+      );
+      token = loginRes.data.token ?? loginRes.data.access_token;
+      if (!token) {
+        console.error('❌ Monroe Login Response completo:', JSON.stringify(loginRes.data, null, 2));
+        throw new Error('Token Monroe vacío');
       }
-    );
-
-    const token = loginRes.data.token ?? loginRes.data.access_token;
-    if (!token) {
-      console.error('❌ Monroe Login Response completo:', JSON.stringify(loginRes.data, null, 2));
-      throw new Error('Token Monroe vacío');
+      monroeTokenCache.set(sucursal, { token, exp: now + MONROE_TOKEN_TTL_MS });
     }
+    // --- FIN NUEVO ---
 
     const body = {
       referencia_cliente: `pedido-${Date.now()}`,
@@ -182,14 +194,13 @@ async function fetchMonroe(ean, sucursal, cantidad) {
 
     const prod = stockRes.data.arrayProductos?.[0];
     if (!prod || prod.Stock?.estado !== 1) {
-      return { stock: false, priceList: null, offerPrice: null, offers: [] };
+      return { stock: false, priceList: null, offerPrice: null, offers: [], token }; // ← devolvemos token igual
     }
 
     const priceList = prod.Precio.lista;
     const rawOffers = Array.isArray(prod.arrayOfertas) ? prod.arrayOfertas : [];
     const offers = [];
 
-    // filtrar por cantidad y armar leyendas
     for (const o of rawOffers) {
       const minU = o.Condicion_Compra?.minimo_unids ?? 0;
       const maxU = o.Condicion_Compra?.maximo_unids ?? Infinity;
@@ -217,17 +228,80 @@ async function fetchMonroe(ean, sucursal, cantidad) {
       }, null);
     }
 
+    // ←←← DEVOLVEMOS token también
     return {
       stock: true,
       priceList,
       offerPrice,
-      offers
+      offers,
+      token
     };
   } catch (err) {
     console.error('Monroe error:', err.message);
-    return { stock: null, priceList: null, offerPrice: null, offers: [] };
+    return { stock: null, priceList: null, offerPrice: null, offers: [], token: null };
   }
 }
+
+
+
+async function crearPedidoMonroe(tabla, sucursal, { referencia = null, fechaEntrega = null } = {}) {
+  const items = tabla
+    .filter(r => r.seleccionado === 'monroe')
+    .map((r, idx) => ({
+      orden: idx + 1,
+      unidades: String(r.cantidad || 1),
+      arrayCodigos: {
+        CodigoBarras: r.codigo_barras,
+        Nombre: r.descripcion || ''
+      }
+    }));
+
+  if (!items.length) return { skip: true, msg: 'No hay productos seleccionados en Monroe.' };
+
+  const ref = referencia || `WEB-${Date.now()}`;
+  const fecha = fechaEntrega || new Date().toISOString().slice(0, 10);
+
+  const body = { referencia_cliente: ref, fecha_de_entrega: fecha, arrayProductos: items };
+
+  try {
+    // toma del cache (o relogin si expiró)
+    const token = monroeTokenCache.get(sucursal)?.token
+      || (await (async () => {
+           // reutiliza la lógica del fetch (login si no hay token o expiró)
+           const [credRows] = await db.query(`
+             SELECT monroe_software_key, monroe_ecommerce_key, monroe_cuenta
+             FROM credenciales_droguerias
+             WHERE sucursal_codigo = ?
+           `, [sucursal]);
+           const { monroe_software_key, monroe_ecommerce_key, monroe_cuenta } = credRows[0];
+           const loginRes = await axios.get('https://servicios.monroeamericana.com.ar/api-cli/Auth/login', {
+             params: { software_key: monroe_software_key, token_duration: 300, ecommerce_customer_key: monroe_ecommerce_key, ecommerce_customer_reference: monroe_cuenta }
+           });
+           const t = loginRes.data.token ?? loginRes.data.access_token;
+           monroeTokenCache.set(sucursal, { token: t, exp: Date.now() + MONROE_TOKEN_TTL_MS });
+           return t;
+         })());
+
+    const url = 'https://servicios.monroeamericana.com.ar/api-cli/ade/1.0.0/crearPedido';
+
+    const resp = await axios.post(url, body, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    });
+
+    return { ok: true, resultado: resp.data, enviado: body };
+  } catch (err) {
+    const detalle = err?.response?.data || err.message;
+    console.error('❌ Error creando pedido en Monroe:', detalle);
+    return { error: 'Fallo al crear el pedido en Monroe', detalle, enviado: body };
+  }
+}
+
+
+
 
 
 
@@ -377,10 +451,119 @@ async function fetchCofarsur(ean, sucursal) {
 }
 
 
+// Crear pedido en Cofarsur
+async function crearPedidoCofarsur(tabla, sucursal, {
+  referencia = `WEB-${Date.now()}`, // no lo pide el servicio, pero lo dejamos por si querés loguear
+  reparto = true,
+} = {}) {
+  try {
+    // 1) Credenciales
+    const [credRows] = await db.query(`
+      SELECT 
+        cofarsur_usuario AS usuario,
+        cofarsur_clave   AS clave,
+        cofarsur_token   AS token
+      FROM credenciales_droguerias
+      WHERE sucursal_codigo = ?
+    `, [sucursal]);
+    if (!credRows.length) throw new Error('Credenciales Cofarsur no encontradas');
+    const { usuario, clave, token } = credRows[0];
+
+    // 2) Items seleccionados en Cofarsur
+    const items = tabla
+      .filter(r => r.seleccionado === 'cofarsur')
+      .map(r => ({
+        codigo_barra: r.codigo_barras,
+        troquel: 0,
+        cantidad: Number(r.cantidad || 1)
+      }));
+
+    if (!items.length) return { skip: true, msg: 'No hay productos seleccionados en Cofarsur.' };
+
+    // 3) Armar los <NS1:productosData> con ids y los <item href="#id">
+    const productosNodes = items.map((it, idx) => `
+      <NS1:productosData id="${idx + 2}" xsi:type="NS1:productosData">
+        <codigo_barra xsi:type="xsd:string">${it.codigo_barra}</codigo_barra>
+        <troquel xsi:type="xsd:int">${it.troquel}</troquel>
+        <cantidad xsi:type="xsd:int">${it.cantidad}</cantidad>
+      </NS1:productosData>
+    `).join('');
+
+    const itemsRefs = items.map((_, idx) => `
+      <item href="#${idx + 2}"/>
+    `).join('');
+
+    // 4) Envelope RPC/encoded (como en Postman)
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope
+  xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/">
+  <SOAP-ENV:Body xmlns:NS1="urn:/ws" SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+    <NS1:SolicitarPedido>
+      <DatosSolicitarPedido href="#1"/>
+    </NS1:SolicitarPedido>
+
+    <NS1:DatosSolicitarPedido id="1" xsi:type="NS1:DatosSolicitarPedido">
+      <usuario xsi:type="xsd:string">${usuario}</usuario>
+      <clave xsi:type="xsd:string">${clave}</clave>
+      <token xsi:type="xsd:string">${token}</token>
+      <reparto xsi:type="xsd:boolean">${reparto ? 'true' : 'false'}</reparto>
+      <productos xsi:type="SOAP-ENC:Array" SOAP-ENC:arrayType="NS1:productosData[${items.length}]">
+        ${itemsRefs}
+      </productos>
+    </NS1:DatosSolicitarPedido>
+
+    ${productosNodes}
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>`.trim();
+
+    console.log('📤 Cofarsur SolicitarPedido XML:', xml);
+
+    // 5) POST
+    const endpoint = 'http://www.cofarsur.net/ws';
+    const resp = await axios.post(endpoint, xml, {
+      headers: {
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction': '"http://tempuri.org/wsdl/SolicitarPedido"' // igual a tu Postman
+      },
+      auth: { username: usuario, password: clave },
+      timeout: 20000
+    });
+
+    console.log('📥 Cofarsur SolicitarPedido RAW:', resp.data);
+
+    // 6) Parseo básico (si querés procesar más, lo ajustamos después)
+    const parsed = await xml2js.parseStringPromise(resp.data, {
+      explicitArray: false,
+      tagNameProcessors: [stripPrefix]
+    });
+    const body = parsed.Envelope?.Body || parsed.Body;
+    if (body?.Fault) {
+      const msg = typeof body.Fault.faultstring === 'object'
+        ? body.Fault.faultstring._
+        : body.Fault.faultstring;
+      return { error: 'Fault Cofarsur', detalle: msg };
+    }
+
+    // buscar respuesta típica:
+    const respuesta = body?.SolicitarPedidoResponse
+                   || body?.return
+                   || body;
+    return { ok: true, resultado: respuesta, enviado: { referencia, items } };
+
+  } catch (err) {
+    const detalle = err?.response?.data || err.message;
+    console.error('❌ Error SolicitarPedido Cofarsur:', detalle);
+    return { error: 'Fallo al crear el pedido en Cofarsur', detalle };
+  }
+}
 
 
 
-// controllers/pedidosController.js
+
+// fetchSuizo
 
 async function fetchSuizo(ean, sucursal) {
   try {
@@ -544,11 +727,12 @@ exports.comparativa = async (req, res) => {
     };
 
     const monroe = {
-      stock: monroeRaw?.stock === true,
-      priceList: normalizePrice(monroeRaw?.priceList),
-      offerPrice: normalizePrice(monroeRaw?.offerPrice),
-      offers: Array.isArray(monroeRaw?.offers) ? monroeRaw.offers : []
-    };
+  stock: monroeRaw?.stock === true,
+  priceList: normalizePrice(monroeRaw?.priceList),
+  offerPrice: normalizePrice(monroeRaw?.offerPrice),
+  offers: Array.isArray(monroeRaw?.offers) ? monroeRaw.offers : [],
+  token: monroeRaw?.token || null   // 👈 guardar token por si querés usarlo directo
+};
 
    const cofarsur = {
   stock: cofarsurRaw?.stock === true,
@@ -612,20 +796,60 @@ tabla.push({
 
 // POST: inyectar selección y disparar pedido a Quantio
 if (req.method === 'POST') {
+  // Actualizar selección desde el form
   tabla.forEach((row, i) => {
     row.seleccionado = req.body[`seleccion_${i}`] || row.seleccionado;
   });
-  console.log('➡️ Sucursal al crear pedido:', req.session.user?.sucursal_codigo);
-  const resultadoPedido = await crearPedidoQuantio(tabla, req.session.user?.sucursal_codigo);
-  if (resultadoPedido.error) {
-    console.warn('Error en pedido Quantio:', resultadoPedido);
-    res.locals.errorQuantio = resultadoPedido;
-  } else {
-    console.log('Pedido Quantio exitoso:', resultadoPedido.resultado);
-    res.locals.successQuantio = resultadoPedido.resultado;
+
+  // --- Quantio: solo si hay Q seleccionados ---
+  const hayQuantio = tabla.some(r => r.seleccionado === 'quantio');
+  if (hayQuantio) {
+    const resQ = await crearPedidoQuantio(tabla, req.session.user?.sucursal_codigo);
+    if (resQ?.error) {
+      console.warn('Error en pedido Quantio:', resQ);
+      res.locals.errorQuantio = resQ;
+    } else {
+      console.log('Pedido Quantio OK:', resQ.resultado);
+      res.locals.successQuantio = resQ.resultado;
+    }
+  }
+
+  // --- Monroe: solo si hay M seleccionados ---
+  const hayMonroe = tabla.some(r => r.seleccionado === 'monroe');
+  if (hayMonroe) {
+    const resM = await crearPedidoMonroe(
+      tabla,
+      req.session.user?.sucursal_codigo,
+      { referencia: `WEB-${Date.now()}` } // opcional fechaEntrega
+    );
+    if (resM?.error) {
+      console.warn('Error en pedido Monroe:', resM);
+      res.locals.errorMonroe = resM;
+    } else if (!resM?.skip) {
+      console.log('Pedido Monroe OK:', resM.resultado);
+      res.locals.successMonroe = resM.resultado;
+    }
+  }
+}
+
+// --- Cofarsur: solo si hay seleccionados en C ---
+const hayC = tabla.some(r => r.seleccionado === 'cofarsur');
+if (hayC) {
+  const resC = await crearPedidoCofarsur(
+    tabla,
+    req.session.user?.sucursal_codigo,
+    { reparto: true } // o false, según tu caso
+  );
+  if (resC?.error) {
+    console.warn('Error en pedido Cofarsur:', resC);
+    res.locals.errorCofarsur = resC;
+  } else if (!resC?.skip) {
+    console.log('Pedido Cofarsur OK:', resC.resultado);
+    res.locals.successCofarsur = resC.resultado;
   }
 }
 
 res.render('comparativa', { tabla });
+
 };
 module.exports.crearPedidoQuantio = crearPedidoQuantio;
